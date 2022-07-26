@@ -949,7 +949,7 @@ func TestWithxlbHealthyThresholdCount(t *testing.T) {
 }
 
 func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
-	tgARNs := []string{"asg1"}
+	tgARNs := []TargetGroupWithLabels{{ARN: "asg1"}}
 	thOut := elbv2.DescribeTargetHealthOutput{TargetHealthDescriptions: []*elbv2.TargetHealthDescription{}}
 	m := &mockElbv2Client{
 		outputs: elbv2MockOutputs{
@@ -961,7 +961,7 @@ func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
 	a := &Adapter{elbv2: m, TargetCNI: &TargetCNIconfig{}}
 
 	t.Run("adding a new endpoint", func(t *testing.T) {
-		require.NoError(t, a.SetTargetsOnCNITargetGroups([]string{"1.1.1.1"}, tgARNs))
+		require.NoError(t, a.SetTargetsOnCNITargetGroups([]CNIEndpoint{{IPAddress: "1.1.1.1"}}, tgARNs))
 		require.Equal(t, []*elbv2.RegisterTargetsInput{{
 			TargetGroupArn: aws.String("asg1"),
 			Targets:        []*elbv2.TargetDescription{{Id: aws.String("1.1.1.1")}},
@@ -975,7 +975,8 @@ func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
 		}
 		m.rtinputs, m.dtinputs = nil, nil
 
-		require.NoError(t, a.SetTargetsOnCNITargetGroups([]string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, tgARNs))
+		require.NoError(t, a.SetTargetsOnCNITargetGroups(
+			[]CNIEndpoint{{IPAddress: "1.1.1.1"}, {IPAddress: "2.2.2.2"}, {IPAddress: "3.3.3.3"}}, tgARNs))
 		require.Equal(t, []*elbv2.TargetDescription{
 			{Id: aws.String("2.2.2.2")},
 			{Id: aws.String("3.3.3.3")},
@@ -991,7 +992,7 @@ func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
 		}}
 		m.rtinputs, m.dtinputs = nil, nil
 
-		require.NoError(t, a.SetTargetsOnCNITargetGroups([]string{"1.1.1.1", "3.3.3.3"}, tgARNs))
+		require.NoError(t, a.SetTargetsOnCNITargetGroups([]CNIEndpoint{{IPAddress: "1.1.1.1"}, {IPAddress: "3.3.3.3"}}, tgARNs))
 		require.Equal(t, []*elbv2.RegisterTargetsInput(nil), m.rtinputs)
 		require.Equal(t, []*elbv2.TargetDescription{{Id: aws.String("2.2.2.2")}}, m.dtinputs[0].Targets)
 	})
@@ -1004,7 +1005,8 @@ func TestAdapter_SetTargetsOnCNITargetGroups(t *testing.T) {
 		}}
 		m.rtinputs, m.dtinputs = nil, nil
 
-		require.NoError(t, a.SetTargetsOnCNITargetGroups([]string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, tgARNs))
+		require.NoError(t, a.SetTargetsOnCNITargetGroups(
+			[]CNIEndpoint{{IPAddress: "1.1.1.1"}, {IPAddress: "2.2.2.2"}, {IPAddress: "3.3.3.3"}}, tgARNs))
 		require.Equal(t, []*elbv2.TargetDescription{{Id: aws.String("3.3.3.3")}}, m.rtinputs[0].Targets)
 		require.Equal(t, []*elbv2.TargetDescription{{Id: aws.String("4.4.4.4")}}, m.dtinputs[0].Targets)
 	})

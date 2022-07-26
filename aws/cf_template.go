@@ -104,6 +104,11 @@ func generateTemplate(spec *stackSpec) (string, error) {
 			Description: "H2 Enabled",
 			Default:     "true",
 		},
+		parameterCascadeParameter: &cloudformation.Parameter{
+			Type:        "String",
+			Description: "Cascade to ALB Enabled",
+			Default:     "false",
+		},
 	}
 
 	if spec.wafWebAclId != "" {
@@ -120,28 +125,41 @@ func generateTemplate(spec *stackSpec) (string, error) {
 			Description: "DNS name for the LoadBalancer",
 			Value:       cloudformation.GetAtt("LB", "DNSName").String(),
 		},
+		outputLoadBalancerARN: &cloudformation.Output{
+			Description: "ARN of the LoadBalancer",
+			Value:       cloudformation.Ref("LB").String(),
+		},
 		outputTargetGroupARN: &cloudformation.Output{
-			Description: "The ARN of the TargetGroup",
+			Description: "The ARN of the main TargetGroup",
 			Value:       cloudformation.Ref(httpsTargetGroupName).String(),
 		},
 	}
 
-	template.AddResource(httpsTargetGroupName, newTargetGroup(spec, parameterTargetGroupTargetPortParameter))
+	listener := ExtraListener{}
+	if spec.cascade {
+		listener = ExtraListener{ListenProtocol: "TCP", ListenPort: 443, TargetPort: 443, cascade: true}
+	}
+	template.AddResource(httpsTargetGroupName, newTargetGroup(spec, parameterTargetGroupTargetPortParameter, listener))
 
 	if !spec.httpDisabled {
 		// Use the same target group for HTTP Listener or create another one if needed
 		httpTargetGroupName := httpsTargetGroupName
-		if spec.httpTargetPort != spec.targetPort {
+		if spec.httpTargetPort != spec.targetPort || spec.cascade {
 			httpTargetGroupName = "TGHTTP"
-			template.Parameters[parameterTargetGroupHTTPTargetPortParameter] = &cloudformation.Parameter{
-				Type:        "Number",
-				Description: "The HTTP target port",
+			listener := ExtraListener{}
+			if spec.cascade {
+				listener = ExtraListener{ListenProtocol: "TCP", ListenPort: 80, TargetPort: 80, cascade: true}
+			} else {
+				template.Parameters[parameterTargetGroupHTTPTargetPortParameter] = &cloudformation.Parameter{
+					Type:        "Number",
+					Description: "The HTTP target port",
+				}
 			}
 			template.Outputs[outputHTTPTargetGroupARN] = &cloudformation.Output{
 				Description: "The ARN of the HTTP TargetGroup",
 				Value:       cloudformation.Ref(httpTargetGroupName).String(),
 			}
-			template.AddResource(httpTargetGroupName, newTargetGroup(spec, parameterTargetGroupHTTPTargetPortParameter))
+			template.AddResource(httpTargetGroupName, newTargetGroup(spec, parameterTargetGroupHTTPTargetPortParameter, listener))
 		}
 
 		// Add an HTTP Listener resource
@@ -204,7 +222,7 @@ func generateTemplate(spec *stackSpec) (string, error) {
 		}
 	}
 
-	if len(spec.certificateARNs) > 0 {
+	if len(spec.certificateARNs) > 0 && !spec.cascade {
 		// Sort the certificate names so we have a stable order.
 		certificateARNs := make([]string, 0, len(spec.certificateARNs))
 		for certARN := range spec.certificateARNs {
@@ -244,7 +262,7 @@ func generateTemplate(spec *stackSpec) (string, error) {
 					),
 				)
 			}
-		} else if spec.loadbalancerType == LoadBalancerTypeNetwork {
+		} else if spec.loadbalancerType == LoadBalancerTypeNetwork && !spec.cascade {
 			template.AddResource("HTTPSListener", &cloudformation.ElasticLoadBalancingV2Listener{
 				DefaultActions: &cloudformation.ElasticLoadBalancingV2ListenerActionList{
 					{
@@ -280,6 +298,41 @@ func generateTemplate(spec *stackSpec) (string, error) {
 			ListenerArn:  cloudformation.Ref("HTTPSListener").String(),
 		})
 
+	}
+
+	if spec.loadbalancerType == LoadBalancerTypeNetwork {
+		if spec.cascade {
+			template.AddResource("HTTPSListener", &cloudformation.ElasticLoadBalancingV2Listener{
+				DefaultActions: &cloudformation.ElasticLoadBalancingV2ListenerActionList{
+					{
+						Type:           cloudformation.String("forward"),
+						TargetGroupArn: cloudformation.Ref(httpsTargetGroupName).String(),
+					},
+				},
+				LoadBalancerArn: cloudformation.Ref("LB").String(),
+				Port:            cloudformation.Integer(443),
+				Protocol:        cloudformation.String("TCP"),
+			})
+		}
+		for idx, listener := range spec.extraListeners {
+			tgName := fmt.Sprintf("ExtraTG%d", idx)
+			template.Outputs[fmt.Sprintf("%sTargetGroupARN", tgName)] = &cloudformation.Output{
+				Description: fmt.Sprintf("The ARN of the %s TargetGroup", tgName),
+				Value:       cloudformation.Ref(tgName).String(),
+			}
+			template.AddResource(tgName, newTargetGroup(spec, parameterTargetGroupHTTPTargetPortParameter, listener))
+			template.AddResource(fmt.Sprintf("ExtraListener%d", idx), &cloudformation.ElasticLoadBalancingV2Listener{
+				DefaultActions: &cloudformation.ElasticLoadBalancingV2ListenerActionList{
+					{
+						Type:           cloudformation.String("forward"),
+						TargetGroupArn: cloudformation.Ref(tgName).String(),
+					},
+				},
+				LoadBalancerArn: cloudformation.Ref("LB").String(),
+				Port:            cloudformation.Integer(listener.ListenPort),
+				Protocol:        cloudformation.String(listener.ListenProtocol),
+			})
+		}
 	}
 
 	// Build up the LoadBalancerAttributes list, as there is no way to make attributes conditional in the template
@@ -444,17 +497,42 @@ func generateDenyInternalTrafficRule(listenerName string, rulePriority int64, in
 	}
 }
 
-func newTargetGroup(spec *stackSpec, targetPortParameter string) *cloudformation.ElasticLoadBalancingV2TargetGroup {
+func newTargetGroup(spec *stackSpec, targetPortParameter string, listener ExtraListener) *cloudformation.ElasticLoadBalancingV2TargetGroup {
 	targetType := elbv2.TargetTypeEnumInstance
 	if spec.targetAccessModeCNI {
 		targetType = elbv2.TargetTypeEnumIp
 	}
 	protocol := "HTTP"
 	healthCheckProtocol := "HTTP"
+	port := cloudformation.Ref(targetPortParameter).Integer()
+	healthCheckPort := cloudformation.Ref(parameterTargetGroupHealthCheckPortParameter).String()
 	healthyThresholdCount, unhealthyThresholdCount := spec.albHealthyThresholdCount, spec.albUnhealthyThresholdCount
+
+	tgAttributes := &cloudformation.ElasticLoadBalancingV2TargetGroupTargetGroupAttributeList{
+		{
+			Key:   cloudformation.String("deregistration_delay.timeout_seconds"),
+			Value: cloudformation.String(fmt.Sprintf("%d", spec.deregistrationDelayTimeoutSeconds)),
+		},
+	}
+
 	if spec.loadbalancerType == LoadBalancerTypeNetwork {
 		protocol = "TCP"
-		healthCheckProtocol = "HTTP"
+		if listener.ListenProtocol != "" {
+			protocol, healthCheckProtocol = listener.ListenProtocol, listener.ListenProtocol
+			port = cloudformation.Integer(listener.TargetPort)
+			healthCheckPort = cloudformation.String(fmt.Sprintf("%d", listener.TargetPort))
+			if listener.cascade {
+				targetType = elbv2.TargetTypeEnumAlb
+				tgAttributes = &cloudformation.ElasticLoadBalancingV2TargetGroupTargetGroupAttributeList{}
+				switch listener.TargetPort {
+				case 443:
+					healthCheckProtocol = "HTTPS"
+				case 80:
+					healthCheckProtocol = "HTTP"
+				}
+			}
+		}
+
 		// For NLBs the healthy and unhealthy threshold count value must be equal
 		healthyThresholdCount, unhealthyThresholdCount = spec.nlbHealthyThresholdCount, spec.nlbHealthyThresholdCount
 	} else if spec.targetHTTPS {
@@ -462,23 +540,40 @@ func newTargetGroup(spec *stackSpec, targetPortParameter string) *cloudformation
 		healthCheckProtocol = "HTTPS"
 	}
 
+	interval := cloudformation.Ref(parameterTargetGroupHealthCheckIntervalParameter).Integer()
+	healthCheckPath := cloudformation.Ref(parameterTargetGroupHealthCheckPathParameter).String()
+	if protocol == "TCP" || healthCheckProtocol == "TCP" {
+		interval = cloudformation.Integer(10)
+		if healthCheckProtocol == "TCP" {
+			healthCheckPath = cloudformation.Ref("AWS::NoValue").String()
+		}
+	}
+
 	targetGroup := &cloudformation.ElasticLoadBalancingV2TargetGroup{
-		TargetGroupAttributes: &cloudformation.ElasticLoadBalancingV2TargetGroupTargetGroupAttributeList{
-			{
-				Key:   cloudformation.String("deregistration_delay.timeout_seconds"),
-				Value: cloudformation.String(fmt.Sprintf("%d", spec.deregistrationDelayTimeoutSeconds)),
-			},
-		},
-		HealthCheckIntervalSeconds: cloudformation.Ref(parameterTargetGroupHealthCheckIntervalParameter).Integer(),
-		HealthCheckPath:            cloudformation.Ref(parameterTargetGroupHealthCheckPathParameter).String(),
-		HealthCheckPort:            cloudformation.Ref(parameterTargetGroupHealthCheckPortParameter).String(),
+		TargetGroupAttributes:      tgAttributes,
+		HealthCheckIntervalSeconds: interval,
+		HealthCheckPath:            healthCheckPath,
+		HealthCheckPort:            healthCheckPort,
 		HealthCheckProtocol:        cloudformation.String(healthCheckProtocol),
 		HealthyThresholdCount:      cloudformation.Integer(int64(healthyThresholdCount)),
 		UnhealthyThresholdCount:    cloudformation.Integer(int64(unhealthyThresholdCount)),
-		Port:                       cloudformation.Ref(targetPortParameter).Integer(),
+		Port:                       port,
 		Protocol:                   cloudformation.String(protocol),
 		TargetType:                 cloudformation.String(targetType),
 		VPCID:                      cloudformation.Ref(parameterTargetGroupVPCIDParameter).String(),
+	}
+
+	if listener.PodLabel != "" {
+		targetGroup.Tags = &cloudformation.TagList{
+			{
+				Key:   cloudformation.String(podLabelTag),
+				Value: cloudformation.String(listener.PodLabel),
+			},
+			{
+				Key:   cloudformation.String(podNamespaceTag),
+				Value: cloudformation.String(listener.Namespace),
+			},
+		}
 	}
 
 	// custom target group healthcheck only supported when the target group protocol is != TCP

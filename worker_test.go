@@ -1006,21 +1006,22 @@ func TestDoWorkPanicReturnsProblem(t *testing.T) {
 
 func Test_cniEventHandler(t *testing.T) {
 	t.Run("handles messages from channels and calls update functions", func(t *testing.T) {
-		targetCNIcfg := &aws.TargetCNIconfig{TargetGroupCh: make(chan []string, 10)}
-		targetCNIcfg.TargetGroupCh <- []string{"bar", "baz"}
-		targetCNIcfg.TargetGroupCh <- []string{"foo"} // flush
+		targetCNIcfg := &aws.TargetCNIconfig{TargetGroupCh: make(chan []aws.TargetGroupWithLabels, 10)}
+		targetCNIcfg.TargetGroupCh <- []aws.TargetGroupWithLabels{{ARN: "bar"}, {ARN: "baz"}}
+		targetCNIcfg.TargetGroupCh <- []aws.TargetGroupWithLabels{{ARN: "foo"}} // flush
 		mutex := &sync.Mutex{}
-		var targetSet, cniTGARNs []string
-		mockTargetSetter := func(endpoints, cniTargetGroupARNs []string) error {
+		var targetSet []aws.CNIEndpoint
+		var cniTGARNs []aws.TargetGroupWithLabels
+		mockTargetSetter := func(endpoints []aws.CNIEndpoint, cniTargetGroupARNs []aws.TargetGroupWithLabels) error {
 			mutex.Lock()
 			targetSet = endpoints
 			cniTGARNs = cniTargetGroupARNs
 			mutex.Unlock()
 			return nil
 		}
-		mockInformer := func(_ context.Context, c chan<- []string) error {
-			c <- []string{"4.3.2.1", "4.3.2.1"}
-			c <- []string{"1.2.3.4"} // flush
+		mockInformer := func(_ context.Context, c chan<- []aws.CNIEndpoint) error {
+			c <- []aws.CNIEndpoint{{IPAddress: "4.3.2.1"}, {IPAddress: "4.3.2.1"}}
+			c <- []aws.CNIEndpoint{{IPAddress: "1.2.3.4"}} // flush
 			return nil
 		}
 		ctx, cl := context.WithCancel(context.Background())
@@ -1030,11 +1031,11 @@ func Test_cniEventHandler(t *testing.T) {
 		require.Eventually(t, func() bool {
 			mutex.Lock()
 			defer mutex.Unlock()
-			return reflect.DeepEqual(targetSet, []string{"1.2.3.4"})
+			return reflect.DeepEqual(targetSet, []aws.CNIEndpoint{{IPAddress: "1.2.3.4"}})
 		}, wait.ForeverTestTimeout, time.Millisecond*100)
 
 		require.Eventually(t, func() bool {
-			return reflect.DeepEqual(cniTGARNs, []string{"foo"})
+			return reflect.DeepEqual(cniTGARNs, []aws.TargetGroupWithLabels{{ARN: "foo"}})
 		}, wait.ForeverTestTimeout, time.Millisecond*100)
 	})
 }

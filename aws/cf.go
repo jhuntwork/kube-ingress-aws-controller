@@ -1,6 +1,8 @@
 package aws
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -15,6 +17,9 @@ const (
 	certificateARNTagPrefix = "ingress:certificate-arn/"
 	ingressOwnerTag         = "ingress:owner"
 	cwAlarmConfigHashTag    = "cloudwatch:alarm-config-hash"
+	extraListenersTag       = "ingress:extra-listeners"
+	podLabelTag             = "ingress:podlabel"
+	podNamespaceTag         = "ingress:podnamespace"
 )
 
 // Stack is a simple wrapper around a CloudFormation Stack.
@@ -29,12 +34,24 @@ type Stack struct {
 	IpAddressType     string
 	LoadBalancerType  string
 	HTTP2             bool
+	ExtraListeners    []ExtraListener
+	Cascade           bool
 	OwnerIngress      string
 	CWAlarmConfigHash string
 	TargetGroupARNs   []string
 	WAFWebACLID       string
 	CertificateARNs   map[string]time.Time
 	tags              map[string]string
+	loadbalancerARN   string
+}
+
+type ExtraListener struct {
+	ListenProtocol string `json:"protocol"`
+	ListenPort     int64  `json:"listenport"`
+	TargetPort     int64  `json:"targetport"`
+	PodLabel       string `json:"podlabel,omitempty"`
+	Namespace      string
+	cascade        bool
 }
 
 // IsComplete returns true if the stack status is a complete state.
@@ -107,12 +124,15 @@ func (o stackOutput) dnsName() string {
 	return o[outputLoadBalancerDNSName]
 }
 
+func (o stackOutput) lbARN() string {
+	return o[outputLoadBalancerARN]
+}
+
 func (o stackOutput) targetGroupARNs() (arns []string) {
-	if arn, ok := o[outputTargetGroupARN]; ok {
-		arns = append(arns, arn)
-	}
-	if arn, ok := o[outputHTTPTargetGroupARN]; ok {
-		arns = append(arns, arn)
+	for k, v := range o {
+		if strings.Contains(k, "TargetGroupARN") {
+			arns = append(arns, v)
+		}
 	}
 	return
 }
@@ -130,6 +150,7 @@ func convertStackParameters(parameters []*cloudformation.Parameter) map[string]s
 const (
 	// The following constants should be part of the Output section of the CloudFormation template
 	outputLoadBalancerDNSName = "LoadBalancerDNSName"
+	outputLoadBalancerARN     = "LoadBalancerARN"
 	outputTargetGroupARN      = "TargetGroupARN"
 	outputHTTPTargetGroupARN  = "HTTPTargetGroupARN"
 
@@ -149,6 +170,7 @@ const (
 	parameterLoadBalancerTypeParameter               = "Type"
 	parameterLoadBalancerWAFWebACLIDParameter        = "LoadBalancerWAFWebACLIDParameter"
 	parameterHTTP2Parameter                          = "HTTP2"
+	parameterCascadeParameter                        = "Cascade"
 )
 
 type stackSpec struct {
@@ -183,6 +205,8 @@ type stackSpec struct {
 	cwAlarms                          CloudWatchAlarmList
 	httpRedirectToHTTPS               bool
 	nlbCrossZone                      bool
+	extraListeners                    []ExtraListener
+	cascade                           bool
 	http2                             bool
 	denyInternalDomains               bool
 	denyInternalDomainsResponse       denyResp
@@ -230,6 +254,7 @@ func createStack(svc cloudformationiface.CloudFormationAPI, spec *stackSpec) (st
 			cfParam(parameterIpAddressTypeParameter, spec.ipAddressType),
 			cfParam(parameterLoadBalancerTypeParameter, spec.loadbalancerType),
 			cfParam(parameterHTTP2Parameter, fmt.Sprintf("%t", spec.http2)),
+			cfParam(parameterCascadeParameter, fmt.Sprintf("%t", spec.cascade)),
 		},
 		Tags:                        tagMapToCloudformationTags(tags),
 		TemplateBody:                aws.String(template),
@@ -272,6 +297,11 @@ func createStack(svc cloudformationiface.CloudFormationAPI, spec *stackSpec) (st
 		params.Tags = append(params.Tags, cfTag(cwAlarmConfigHashTag, spec.cwAlarms.Hash()))
 	}
 
+	if len(spec.extraListeners) > 0 {
+		listeners, _ := json.Marshal(spec.extraListeners)
+		params.Tags = append(params.Tags, cfTag(extraListenersTag, base64.StdEncoding.EncodeToString(listeners)))
+	}
+
 	resp, err := svc.CreateStack(params)
 	if err != nil {
 		return spec.name, err
@@ -305,6 +335,7 @@ func updateStack(svc cloudformationiface.CloudFormationAPI, spec *stackSpec) (st
 			cfParam(parameterIpAddressTypeParameter, spec.ipAddressType),
 			cfParam(parameterLoadBalancerTypeParameter, spec.loadbalancerType),
 			cfParam(parameterHTTP2Parameter, fmt.Sprintf("%t", spec.http2)),
+			cfParam(parameterCascadeParameter, fmt.Sprintf("%t", spec.cascade)),
 		},
 		Tags:         tagMapToCloudformationTags(tags),
 		TemplateBody: aws.String(template),
@@ -343,6 +374,11 @@ func updateStack(svc cloudformationiface.CloudFormationAPI, spec *stackSpec) (st
 
 	if len(spec.cwAlarms) > 0 {
 		params.Tags = append(params.Tags, cfTag(cwAlarmConfigHashTag, spec.cwAlarms.Hash()))
+	}
+
+	if len(spec.extraListeners) > 0 {
+		listeners, _ := json.Marshal(spec.extraListeners)
+		params.Tags = append(params.Tags, cfTag(extraListenersTag, base64.StdEncoding.EncodeToString(listeners)))
 	}
 
 	if spec.stackTerminationProtection {
@@ -456,6 +492,7 @@ func mapToManagedStack(stack *cloudformation.Stack) *Stack {
 
 	certificateARNs := make(map[string]time.Time, len(tags))
 	ownerIngress := ""
+	var extraListeners []ExtraListener
 	for key, value := range tags {
 		if strings.HasPrefix(key, certificateARNTagPrefix) {
 			arn := strings.TrimPrefix(key, certificateARNTagPrefix)
@@ -475,11 +512,21 @@ func mapToManagedStack(stack *cloudformation.Stack) *Stack {
 		if key == ingressOwnerTag {
 			ownerIngress = value
 		}
+
+		if key == extraListenersTag {
+			decodedListeners, _ := base64.StdEncoding.DecodeString(value)
+			json.Unmarshal(decodedListeners, &extraListeners)
+		}
 	}
 
 	http2 := true
 	if parameters[parameterHTTP2Parameter] == "false" {
 		http2 = false
+	}
+
+	cascade := false
+	if parameters[parameterCascadeParameter] == "true" {
+		cascade = true
 	}
 
 	return &Stack{
@@ -499,6 +546,9 @@ func mapToManagedStack(stack *cloudformation.Stack) *Stack {
 		statusReason:      aws.StringValue(stack.StackStatusReason),
 		CWAlarmConfigHash: tags[cwAlarmConfigHashTag],
 		WAFWebACLID:       parameters[parameterLoadBalancerWAFWebACLIDParameter],
+		ExtraListeners:    extraListeners,
+		Cascade:           cascade,
+		loadbalancerARN:   outputs.lbARN(),
 	}
 }
 

@@ -137,6 +137,8 @@ Overview of configuration which can be set via Ingress annotations.
 |`zalando.org/aws-load-balancer-ssl-policy`|`string`|`ELBSecurityPolicy-2016-08`|
 |`zalando.org/aws-load-balancer-type`| `nlb` \| `alb`|`alb`|
 |`zalando.org/aws-load-balancer-http2`| `true` \| `false`|`true`|
+|[`zalando.org/aws-nlb-cascade-http-to-alb`](#cascading-to-an-alb)| `true` \| `false`|`false`|
+|[`zalando.org/aws-nlb-extra-listeners`](#extra-listen-ports)|`string`|N/A|
 |`zalando.org/aws-waf-web-acl-id` | `string` | N/A |
 |`kubernetes.io/ingress.class`|`string`|N/A|
 
@@ -663,6 +665,37 @@ In *AWS CNI Mode* (`target-access-mode=AWSCNI`) the controller actively manages 
 | `AWSCNI`    |   `true`    |  `true`  | PodIP == HostIP: limited scaling and host bound |
 | `AWSCNI`    |   `false`   |  `true`  | PodIP != HostIP: limited scaling and host bound |
 | `AWSCNI`    |   `false`   | `false`  | free scaling, pod VPC CNI IP used               |
+
+## Advanced Options for NLBs
+
+### Extra Listen Ports
+
+Some real world scenarios may require non-standard TCP or UDP ingresses. The `zalando.org/aws-nlb-extra-listeners`
+annotation allows you to specify a list of additional listeners to add to your NLB. The value of the annotation should
+be a valid JSON string of the following format.
+
+```json
+[
+    {
+        "protocol": "TCP",
+        "listenport": 22,
+        "targetport": 2222,
+        "podlabel": "application=ssh-service"
+    }
+]
+```
+
+The `podlabel` value is used to register targets in the target group associated with the listener. This depends on the
+AWS CNI Mode feature, where individual pods receive accessible IP addresses. The value is used to identify pods running
+in the same namespace as the ingress that will receive traffic from the load balancer.
+
+### Cascading to an ALB
+
+If your usage of an NLB requires both HTTP(S) and extra listen ports, but you already have an ALB managed by
+kube-ingress-aws-controller, you may wish to route the HTTP(S) traffic through the ALB for consistency. Some
+applications may even depend on ALB features, for example the way SSL is offloaded or how redirects are handled.
+The `zalando.org/aws-nlb-cascade-http-to-alb` allows the NLB to use TCP listeners on standard ports to forward
+HTTP(S) traffic to any ALBs discovered and managed by kube-ingress-aws-controller.
 
 ## Trying it out
 
